@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.sqlite*
+.git/
+.gitignore
+.env
+*.log
+node_modules/
+.vpm/
+.claude/
+.cursor/
+.clinerules/
+.pytest_cache/
+.taskmaster/
