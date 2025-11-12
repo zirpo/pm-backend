@@ -1,0 +1,91 @@
+name: Coverage Report
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  coverage:
+    name: Generate Coverage Report
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov pytest-asyncio coverage-badge
+
+    - name: Set up test environment
+      run: |
+        cp .env.example .env.test
+        echo "TEST_ENV=test" >> .env.test
+        echo "DATABASE_URL=sqlite:///./test_coverage.db" >> .env.test
+        echo "SUPER_SECRET_API_KEY=test-coverage-key" >> .env.test
+        echo "GEMINI_API_KEY=test-key-for-coverage" >> .env.test
+        echo "DEEPSEEK_API_KEY=test-key-for-coverage" >> .env.test
+
+    - name: Run tests with coverage
+      run: |
+        pytest tests/ -v --cov=. --cov-report=xml --cov-report=html --cov-report=term-missing --cov-fail-under=80
+
+    - name: Generate coverage badge
+      run: |
+        coverage-badge -f coverage.xml -o coverage-badge.svg
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+    - name: Upload coverage reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: coverage-report
+        path: |
+          htmlcov/
+          coverage.xml
+          coverage-badge.svg
+
+    - name: Comment coverage on PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const path = './coverage.xml';
+
+          if (fs.existsSync(path)) {
+            const coverage = fs.readFileSync(path, 'utf8');
+            const lineRateMatch = coverage.match(/line-rate="([0-9.]+)"/);
+            const lineRate = lineRateMatch ? parseFloat(lineRateMatch[1]) * 100 : 0;
+
+            const comment = `
+            ## 📊 Test Coverage Report
+
+            **Overall Coverage: ${lineRate.toFixed(1)}%**
+
+            ${lineRate >= 80 ? '✅' : '❌'} Coverage is ${lineRate >= 80 ? 'above' : 'below'} the 80% threshold
+
+            [View detailed coverage report](https://codecov.io/gh/${{ github.repository }}/pull/${{ github.event.number }})
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+          }

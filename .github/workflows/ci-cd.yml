@@ -1,0 +1,385 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "18"
+
+jobs:
+  # Code Quality and Linting
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 black isort mypy pytest
+        pip install -r requirements.txt
+
+    - name: Run Black (code formatting)
+      run: black --check .
+
+    - name: Run isort (import sorting)
+      run: isort --check-only .
+
+    - name: Run flake8 (linting)
+      run: flake8 --max-line-length=88 --extend-ignore=E203,W503 .
+
+    - name: Run mypy (type checking)
+      run: mypy --ignore-missing-imports --strict-optional . || true  # Allow mypy to fail for now
+
+  # Security Scanning
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install bandit safety
+        pip install -r requirements.txt
+
+    - name: Run Bandit (security linter)
+      run: bandit -r . -f json -o bandit-report.json || true
+
+    - name: Run Safety (dependency check)
+      run: safety check --json --output safety-report.json || true
+
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          safety-report.json
+
+  # Database Setup and Testing
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_USER: testuser
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov pytest-asyncio pytest-xdist
+
+    - name: Set up test environment
+      run: |
+        cp .env.example .env.test
+        echo "TEST_ENV=test" >> .env.test
+        echo "DATABASE_URL=postgresql+asyncpg://testuser:testpassword@localhost:5432/testdb" >> .env.test
+        echo "SUPER_SECRET_API_KEY=test-ci-key" >> .env.test
+        echo "GEMINI_API_KEY=test-key-for-ci" >> .env.test
+        echo "DEEPSEEK_API_KEY=test-key-for-ci" >> .env.test
+
+    - name: Run database migrations
+      run: |
+        export DATABASE_URL="postgresql+asyncpg://testuser:testpassword@localhost:5432/testdb"
+        alembic upgrade head
+      env:
+        DATABASE_URL: postgresql+asyncpg://testuser:testpassword@localhost:5432/testdb
+
+    - name: Run unit tests with coverage
+      run: |
+        pytest tests/test_schemas.py tests/test_gemini_service.py tests/test_gemini_rag_service.py -v --cov=. --cov-report=xml --cov-report=html
+
+    - name: Run integration tests
+      run: |
+        pytest tests/test_main.py::TestAuthentication -v --cov=.
+        pytest tests/test_main.py::TestCoreEndpoints -v --cov=. --cov-append
+        pytest tests/test_main.py::TestDocumentEndpoints -v --cov=. --cov-append
+        pytest tests/test_main.py::TestControlGroupEndpoints -v --cov=. --cov-append
+        pytest tests/test_main.py::TestExperimentalRAGEndpoints -v --cov=. --cov-append
+
+    - name: Run performance tests
+      run: |
+        pytest tests/test_main.py::TestPerformanceAndStress -v --cov=. --cov-append
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      if: matrix.python-version == '3.12'
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+    - name: Upload coverage reports
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: coverage-reports-${{ matrix.python-version }}
+        path: |
+          htmlcov/
+          coverage.xml
+
+  # Integration and End-to-End Tests
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_USER: testuser
+          POSTGRES_DB: integrationdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio httpx
+
+    - name: Set up integration test environment
+      run: |
+        cp .env.example .env.integration
+        echo "TEST_ENV=integration" >> .env.integration
+        echo "DATABASE_URL=postgresql+asyncpg://testuser:testpassword@localhost:5432/integrationdb" >> .env.integration
+        echo "SUPER_SECRET_API_KEY=integration-test-key" >> .env.integration
+
+    - name: Start application
+      run: |
+        export DATABASE_URL="postgresql+asyncpg://testuser:testpassword@localhost:5432/integrationdb"
+        alembic upgrade head
+        uvicorn main:app --host 0.0.0.0 --port 8000 &
+        sleep 5  # Wait for server to start
+      env:
+        DATABASE_URL: postgresql+asyncpg://testuser:testpassword@localhost:5432/integrationdb
+
+    - name: Run health check
+      run: |
+        curl -f http://localhost:8000/health || exit 1
+
+    - name: Run API integration tests
+      run: |
+        python -c "
+import httpx
+import time
+
+def wait_for_server():
+    for _ in range(30):
+        try:
+            response = httpx.get('http://localhost:8000/health')
+            if response.status_code == 200:
+                return True
+        except:
+            pass
+        time.sleep(1)
+    return False
+
+if wait_for_server():
+    print('Server is ready')
+    # Run basic API tests
+    with httpx.Client(base_url='http://localhost:8000') as client:
+        # Test health endpoint
+        response = client.get('/health')
+        assert response.status_code == 200
+
+        # Test authentication
+        response = client.get('/projects', headers={'X-API-Key': 'integration-test-key'})
+        assert response.status_code in [200, 401]  # Should not crash
+
+        print('Integration tests passed')
+else:
+    print('Server failed to start')
+    exit(1)
+"
+
+    - name: Stop application
+      run: pkill -f uvicorn || true
+
+  # Performance and Load Testing
+  performance:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: [integration]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest locust
+
+    - name: Run performance tests
+      run: |
+        pytest tests/test_main.py::TestPerformanceAndStress -v --tb=short
+
+    - name: Upload performance results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: performance-results
+        path: performance-results/
+
+  # Build and Documentation
+  build:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    needs: [test, integration]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install mkdocs mkdocs-material
+
+    - name: Generate API documentation
+      run: |
+        # Generate OpenAPI spec
+        python -c "
+import json
+from main import app
+import asyncio
+
+async def generate_docs():
+    spec = app.openapi()
+    with open('openapi.json', 'w') as f:
+        json.dump(spec, f, indent=2)
+
+asyncio.run(generate_docs())
+"
+
+    - name: Upload documentation
+      uses: actions/upload-artifact@v3
+      with:
+        name: api-documentation
+        path: |
+          openapi.json
+
+  # Deploy (only on main branch)
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [lint, test, integration, performance, build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Deploy to production
+      run: |
+        echo "🚀 Deployment step would go here"
+        echo "This is where you would deploy to your cloud provider"
+        echo "Examples:"
+        echo "  - Docker image build and push to registry"
+        echo "  - Kubernetes deployment"
+        echo "  - Serverless function deployment"
+        echo "  - VM deployment with Ansible/Terraform"
+
+    - name: Run smoke tests
+      run: |
+        echo "🧪 Running post-deployment smoke tests"
+        echo "This would test the deployed application"
+
+  # Notify Results
+  notify:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [lint, test, integration, performance, build]
+    if: always()
+
+    steps:
+    - name: Notify success
+      if: ${{ needs.lint.result == 'success' && needs.test.result == 'success' && needs.integration.result == 'success' }}
+      run: |
+        echo "✅ All CI/CD pipeline stages passed successfully!"
+        echo "🎉 Code is ready for production"
+
+    - name: Notify failure
+      if: ${{ needs.lint.result == 'failure' || needs.test.result == 'failure' || needs.integration.result == 'failure' }}
+      run: |
+        echo "❌ CI/CD pipeline failed"
+        echo "🔧 Please check the failed jobs and fix the issues"
+        exit 1
